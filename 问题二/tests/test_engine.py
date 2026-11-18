@@ -203,6 +203,41 @@ class EngineTests(unittest.TestCase):
         self.assertEqual(compact[-1]["content"], "请使用原生工具调用执行刚才提出的操作。")
         self.assertIn('"name":"read_file"', compact[-2]["content"])
 
+    def test_resume_then_compact_keeps_original_request_files_and_open_tasks(self):
+        original = "完善解析器。" + "保留兼容行为。" * 48 + "补充验证。"
+        history = [
+            {"role": "user", "content": original},
+            reply(call(1, "write_file", '{"path":"src/parser.py"}'), text="待办：补边界用例"),
+            {"role": "tool", "id": "1", "content": "已完成：补边界用例", "ok": True},
+            reply(text="待办：检查输出编码"),
+            {"role": "user", "content": "继续验证"}, reply(text="x" * 20000),
+        ]
+        engine = self.make([reply(text="待办：检查输出编码"), reply(text="好")],
+                           history=history, context_window=7000)
+        engine.turn("继续执行原计划")
+
+        def summary():
+            request = engine.provider.requests[-1]
+            assert_legal(self, request)
+            note, task = request[1]["content"].split("\n\n当前任务：\n")
+            return json.loads(note.split("\n", 1)[1]), task
+
+        info, task = summary()
+        self.assertEqual(task, "继续执行原计划")
+        self.assertIn(original, info["早先的任务"])
+        self.assertEqual(info["文件工具修改的文件"], {"src/parser.py": "已确认"})
+        self.assertEqual(info["未完成事项"], ["补边界用例", "检查输出编码"])
+        engine.turn("已完成：补边界用例")
+        self.assertEqual(summary()[0]["未完成事项"], ["检查输出编码"])
+
+    def test_pending_checklist_reopens_and_ignores_code_examples(self):
+        current = {"role": "user", "content": "继续"}
+        messages = [reply(text="TODO:\n- 第一项\n- 第二项"),
+                    reply(text="- [x] 第一项\n- [ ] 第三项\n已完成：第二项"),
+                    reply(text="待办：第一项\n```text\n已完成：第三项\n```"), current]
+        note = _summary(messages, current, excerpt=32)
+        self.assertEqual(json.loads(note.split("\n", 1)[1])["未完成事项"], ["第三项", "第一项"])
+
     def test_repeated_cycles_length_one_two_three(self):
         for cycle in (1, 2, 3):
             with self.subTest(size=cycle):
