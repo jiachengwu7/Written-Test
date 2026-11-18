@@ -59,20 +59,60 @@ def _arguments(call):
         return call["arguments"]
 
 
-def _looks_like_tool_text(content):
-    candidate = content.strip()
-    fence = re.fullmatch(r"```(?:json)?\s*(.*?)\s*```", candidate, flags=re.DOTALL)
-    if fence:
-        candidate = fence.group(1)
-    try:
-        value = json.loads(candidate)
-    except (ValueError, RecursionError):
+def _is_text_call(value):
+    if not isinstance(value, dict):
         return False
-    return isinstance(value, dict) and (
-        "tool_calls" in value or
-        (("name" in value or "tool" in value) and
-         ("arguments" in value or "parameters" in value))
-    )
+    if value.get("type") == "tool_use":
+        return isinstance(value.get("name"), str) and "input" in value
+    if value.get("type") == "function":
+        value = value.get("function")
+        if not isinstance(value, dict):
+            return False
+    return (isinstance(value.get("name") or value.get("tool"), str)
+            and ("arguments" in value or "parameters" in value))
+
+
+TEXT_JSON_START = re.compile(r"```|~~~|(?:^|(?<=[\s：:。]))[\[{]")
+EXAMPLE_LABEL = re.compile(r"(?:示例|例子|例如|举例|example)(?:如下)?\s*[:：]?\s*$", re.I)
+FORMAT_REQUEST = re.compile(
+    r"^(?:(?:请你?|帮我|只需|只要|只)\s*)*(?:解释|说明|举例|演示|展示|给出|给我|提供|输出|"
+    r"(?:please\s+)?(?:explain|show|give|provide)\b)", re.I)
+
+
+def _looks_like_tool_text(content, task):
+    # 对于明确要求说明调用格式的任务，JSON 本身可以是交付内容。
+    if (FORMAT_REQUEST.match(task.lstrip())
+            and re.search(r"解释|说明|示例|例子|举例|\b(?:explain|examples?)\b", task, re.I)
+            and re.search(r"调用格式|工具调用|工具参数|json|tool_use|tool_calls?", task, re.I)):
+        return False
+    decoder = json.JSONDecoder()
+    pos = 0
+    while match := TEXT_JSON_START.search(content, pos):
+        token = match[0]
+        example = EXAMPLE_LABEL.search(content, pos, match.start())
+        if token in ("```", "~~~"):
+            end = content.find(token, match.end())
+            if end < 0:
+                break
+            pos = end + len(token)
+            block = content[match.end():end].strip()
+            block = re.sub(r"^json\b\s*", "", block, count=1, flags=re.I)
+            try:
+                value = json.loads(block)
+            except (ValueError, RecursionError):
+                continue
+        else:
+            try:
+                value, pos = decoder.raw_decode(content, match.start())
+            except (ValueError, RecursionError):
+                pos = match.end()
+                continue
+        if isinstance(value, dict) and "tool_calls" in value:
+            value = value["tool_calls"]
+        calls = value if isinstance(value, list) else [value]
+        if not example and any(_is_text_call(call) for call in calls):
+            return True
+    return False
 
 
 def _recurring(actions):
@@ -283,8 +323,9 @@ class Engine:
                     seen.add(call["id"])
                 self._record(reply)
                 if not calls:
-                    if _looks_like_tool_text(reply["content"]):
-                        self._record({"role": "user", "content": "请使用原生工具调用执行刚才提出的操作。"})
+                    if _looks_like_tool_text(reply["content"], task):
+                        self._record({"role": "user", "content": "若原任务需要操作，请通过原生工具调用完成；"
+                                      "若只需说明格式，请在代码块前标明“调用示例”。"})
                         continue
                     if reply.get("finish") in ("length", "max_tokens"):
                         self._record({"role": "user", "content": "上一条回复已截断。请从中断处继续。"})

@@ -179,6 +179,41 @@ class EngineTests(unittest.TestCase):
         self.assertIn("截断", engine.history[-2]["content"])
         assert_legal(self, engine.history)
 
+    def test_textual_call_requires_a_native_retry(self):
+        short = '{"name":"list_files","arguments":{}}'
+        anthropic = '{"type":"tool_use","name":"list_files","input":{}}'
+        openai = '{"type":"function","function":{"name":"list_files","arguments":"{}"}}'
+        for content in (
+                "我先列出工作目录。\n```json\n" + short + "\n```",
+                "我将调用：" + anthropic + "，然后分析文件。",
+                anthropic,
+                "```JSON\n[" + anthropic + "]\n```",
+                json.dumps({"tool_calls": [json.loads(openai)]}),
+        ):
+            with self.subTest(content=content):
+                engine = self.make([reply(text=content), reply(call("native", "list_files", "{}")),
+                                    reply(text="完成")])
+                self.assertEqual(engine.turn("实现 JSON 解析器并给出示例，请先列出当前目录"), "完成")
+                self.assertIn("原生工具", engine.provider.requests[1][-1]["content"])
+                self.assertEqual(engine.tools.attempts, [("list_files", "{}")])
+                assert_legal(self, engine.history)
+
+    def test_examples_and_ordinary_json_are_returned_as_text(self):
+        sample = '{"type":"tool_use","name":"list_files","input":{}}'
+        for task, content in (
+                ("请解释 list_files 的调用格式", sample),
+                ("给出工具调用的 JSON 示例", '{"name":"read_file","arguments":{"path":"a"}}'),
+                ("整理说明文档", "调用示例：\n```json\n" + sample + "\n```"),
+                ("查看结果", '{"tool_calls":0}'),
+                ("查看结果", '{"payload":' + sample + '}'),
+                ("给出代码", '```python\nvalue = ' + sample + '\n```'),
+        ):
+            with self.subTest(task=task, content=content):
+                engine = self.make([reply(text=content)])
+                self.assertEqual(engine.turn(task), content)
+                self.assertEqual(len(engine.provider.requests), 1)
+                self.assertFalse(engine.tools.attempts)
+
     def test_empty_final_reply_stays_valid_on_next_turn(self):
         from mini_agent.providers import anthropic_request
 
