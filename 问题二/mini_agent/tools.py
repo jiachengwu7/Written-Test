@@ -1,5 +1,6 @@
 """本地工作区工具及其参数校验。"""
 
+import codecs
 import difflib
 import fnmatch
 import os
@@ -39,6 +40,8 @@ class EditFile(Args, title="编辑文件"):
     path: str = Field(title="文件路径")
     old_string: str = Field(min_length=1, title="待替换文本")
     new_string: str = Field(title="替换后的文本")
+    encoding: str | None = Field(None, title="原文件编码",
+                                 description="可显式指定原编码，例如 gbk、cp1252 或无 BOM 的 utf-16-le。")
 
 
 class Grep(Args, title="搜索文本"):
@@ -63,6 +66,48 @@ _TOOLS = {
     "run_shell": (RunShell, "在工作区执行终端命令，返回退出码、标准输出和标准错误。"),
 }
 _IGNORED = {".git", ".venv", "node_modules", "__pycache__", ".uv-cache", ".mini-code-agent"}
+
+# UTF-32 LE 的字节序标记以 UTF-16 LE 标记开头，先匹配较长的标记。
+_BYTE_ORDER_MARKS = (
+    (codecs.BOM_UTF32_LE, "utf-32-le"), (codecs.BOM_UTF32_BE, "utf-32-be"),
+    (codecs.BOM_UTF16_LE, "utf-16-le"), (codecs.BOM_UTF16_BE, "utf-16-be"),
+    (codecs.BOM_UTF8, "utf-8"),
+)
+_EDIT_ENCODINGS = {"utf-8", "utf-16-le", "utf-16-be", "utf-32-le", "utf-32-be",
+                   "ascii", "gbk", "gb18030", "big5", "shift_jis", "cp1252", "iso8859-1"}
+
+
+def _decode_for_edit(original, encoding):
+    if encoding is not None:
+        try:
+            encoding = codecs.lookup(encoding).name
+        except (LookupError, ValueError) as exc:
+            raise ValueError("无法识别指定的文件编码") from exc
+        if encoding == "utf-8-sig":
+            encoding = "utf-8"
+    bom = b""
+    for marker, codec in _BYTE_ORDER_MARKS:
+        if original.startswith(marker):
+            if encoding not in (None, codec, codec.removesuffix("-le").removesuffix("-be")):
+                raise ValueError("指定的编码与文件的 BOM 不一致")
+            bom, encoding = marker, codec
+            break
+    if encoding in ("utf-16", "utf-32"):
+        raise ValueError("文件没有 BOM，请通过 encoding 明确指定大端或小端编码")
+    if encoding is not None and encoding not in _EDIT_ENCODINGS:
+        raise ValueError(f"暂不支持编辑编码为 {encoding} 的文件")
+    payload = original[len(bom):]
+    for codec in ((encoding,) if encoding else ("utf-8", "gbk", "gb18030")):
+        try:
+            text = payload.decode(codec)
+        except UnicodeDecodeError:
+            continue
+        if "\x00" in text:
+            raise ValueError("文本含空字符，请确认文件类型及 encoding 指定的字节序")
+        if text.encode(codec) != payload:
+            raise ValueError("按此编码重新编码会改变原始字节，请核对文件编码")
+        return text, codec, bom
+    raise ValueError("无法按候选编码解码，请通过 encoding 指定原文件编码")
 
 
 def _validation_message(problem):
@@ -250,9 +295,11 @@ class Tools:
             raise ValueError("指定路径必须指向普通文件")
         return target.read_bytes()
 
-    def _replace(self, path, original, content):
-        old = (original or b"").decode("utf-8-sig")
-        # 编辑时保留匹配区域之外的原有换行符，写入时沿用原文件的字节序标记。
+    def _replace(self, path, original, old, content, encoding, bom):
+        try:
+            data = bom + content.encode(encoding)
+        except UnicodeEncodeError as exc:
+            raise ValueError(f"替换后的文本含有 {encoding} 无法表示的字符") from exc
         preview = difflib.unified_diff(old.splitlines(keepends=True), content.splitlines(keepends=True),
                                        fromfile=path if original is not None else "/dev/null", tofile=path)
         prompt = f"写入文件 {path}\n" + "\n".join(line.rstrip("\n") for line in preview)
@@ -262,7 +309,6 @@ class Tools:
         if self._original(target) != original:
             raise ValueError("预览后文件已更改，请重新读取后重试")
         target.parent.mkdir(parents=True, exist_ok=True)
-        data = content.encode("utf-8-sig" if (original or b"").startswith(b"\xef\xbb\xbf") else "utf-8")
         with tempfile.NamedTemporaryFile(dir=target.parent, delete=False) as tmp:
             temp_path = Path(tmp.name)
             try:
@@ -277,19 +323,26 @@ class Tools:
         return f"已写入 {path}"[:1500], True
 
     def _write_file(self, path, content):
-        return self._replace(path, self._original(self._path(path)), content)
+        original = self._original(self._path(path))
+        old = (original or b"").decode("utf-8-sig")
+        bom = codecs.BOM_UTF8 if (original or b"").startswith(codecs.BOM_UTF8) else b""
+        return self._replace(path, original, old, content, "utf-8", bom)
 
-    def _edit_file(self, path, old_string, new_string):
+    def _edit_file(self, path, old_string, new_string, encoding=None):
         original = self._original(self._path(path))
         if original is None:
             raise ValueError("文件不存在")
-        text = original.decode("utf-8-sig")
+        text, codec, bom = _decode_for_edit(original, encoding)
         index = text.find(old_string)
         if index < 0:
             raise ValueError("未找到 old_string 指定的文本")
         if text.find(old_string, index + 1) >= 0:
             raise ValueError("old_string 匹配了多个位置")
-        return self._replace(path, original, text.replace(old_string, new_string, 1))
+        # 纯 ASCII 匹配无法区分多种旧编码，写入非 ASCII 字符前需明确原编码。
+        if encoding is None and codec in ("gbk", "gb18030") and old_string.isascii() and not new_string.isascii():
+            raise ValueError("仅凭 ASCII 匹配无法确认原文件编码，请显式指定 encoding")
+        updated = text[:index] + new_string + text[index + len(old_string):]
+        return self._replace(path, original, text, updated, codec, bom)
 
     def _run_shell(self, command, timeout, expected_stdout=None):
         if not self.confirm(f"在 {self.root} 中执行命令\n{command}"):

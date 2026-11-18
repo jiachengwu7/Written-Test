@@ -1,3 +1,4 @@
+import codecs
 import json
 import os
 import shlex
@@ -77,6 +78,52 @@ class ToolTests(unittest.TestCase):
         target.write_bytes(original)
         self.assertTrue(self.call("edit_file", path="file", old_string="bravo", new_string="B")[1])
         self.assertEqual(original.replace(b"bravo", b"B"), target.read_bytes())
+
+    def test_edit_preserves_legacy_encoding_byte_order_and_line_endings(self):
+        target = self.root / "file"
+        for codec, bom, options, word in [
+            ("gbk", b"", {}, "中文"),
+            ("gb18030", b"", {}, "𠀀"),
+            ("utf-16-le", codecs.BOM_UTF16_LE, {}, "中文"),
+            ("utf-16-be", codecs.BOM_UTF16_BE, {}, "中文"),
+            ("utf-32-le", codecs.BOM_UTF32_LE, {}, "中文"),
+            ("utf-16-le", b"", {"encoding": "utf-16-le"}, "中文"),
+            ("cp1252", b"", {"encoding": "windows-1252"}, "café"),
+        ]:
+            with self.subTest(codec=codec, bom=bom):
+                original = "a\r\n" + word + "\nb"
+                target.write_bytes(bom + original.encode(codec))
+                message, ok = self.call("edit_file", path="file", old_string=word, new_string=word + "!", **options)
+                self.assertTrue(ok, message)
+                self.assertEqual(target.read_bytes(), bom + ("a\r\n" + word + "!\nb").encode(codec))
+                self.assertIn("+" + word + "!", self.prompts[-1])
+
+    def test_edit_rejects_encoding_errors_before_confirmation(self):
+        target = self.root / "file"
+        for original, old, new, options in [
+            ("中文".encode("gbk"), "中文", "😀", {}),
+            (codecs.BOM_UTF16_BE + "x".encode("utf-16-be"), "x", "y", {"encoding": "utf-16-le"}),
+            (b"a\x00b\x00", "a", "b", {}),
+            (b"plain", "plain", "new", {"encoding": "unknown-codec"}),
+        ]:
+            with self.subTest(original=original):
+                self.prompts.clear()
+                target.write_bytes(original)
+                self.assertFalse(self.call("edit_file", path="file", old_string=old, new_string=new, **options)[1])
+                self.assertFalse(self.prompts)
+                self.assertEqual(target.read_bytes(), original)
+
+    def test_explicit_encoding_resolves_an_ambiguous_legacy_edit(self):
+        target = self.root / "file"
+        original = b"\xc4\xe3 label"
+        target.write_bytes(original)
+        args = dict(path="file", old_string="label", new_string="中文")
+        message, ok = self.call("edit_file", **args)
+        self.assertFalse(ok)
+        self.assertIn("encoding", message)
+        self.assertEqual(target.read_bytes(), original)
+        self.assertTrue(self.call("edit_file", **args, encoding="gbk")[1])
+        self.assertEqual(target.read_bytes(), b"\xc4\xe3 " + "中文".encode("gbk"))
 
     def test_globs_grep_and_ignored_directories(self):
         for filename in ["a.py", "src/b.py", "src/c.txt", ".git/secrets.py", "node_modules/dep.py"]:

@@ -74,9 +74,11 @@ uv run --frozen mini-code-agent
 | `list_files` | `path` 默认当前目录，指定 `pattern` 可递归 glob 匹配，遍历时跳过 .git、node_modules 和虚拟环境等目录 |
 | `read_file` | `path`、可选 `start_line` 和 `end_line`，按从 1 开始的闭区间返回带行号的 UTF-8 文本。指定结束行时读到该行即停，区间输出截断时报告区间内的实际行数 |
 | `write_file` | `path`、`content`，显示 diff，确认后创建父目录并原子替换文件 |
-| `edit_file` | `path`、`old_string`、`new_string`，旧文本须精确命中一处。保留 UTF-8 BOM 和未修改部分的换行字节 |
+| `edit_file` | `path`、`old_string`、`new_string`，可选 `encoding` 指定原文件编码。旧文本须唯一匹配，写回时保留原编码、字节序、BOM 及替换区域以外的换行 |
 | `grep` | `pattern` 正则，可选 `path`、`glob`，返回匹配路径、行号和文本 |
 | `run_shell` | `command`、`timeout`（默认 60 秒），从工作目录启动，返回退出码和输出。验证短文本可传 `expected_stdout`，完整标准输出一致且进程正常退出才算通过；统一 CRLF/LF 并忽略一个末尾换行，截断时报告无法核验 |
+
+编辑已有文件时，`edit_file` 优先识别 UTF-8、UTF-16、UTF-32 的 BOM。无 BOM 时依次尝试 UTF-8、GBK、GB18030。如果已知原编码，应直接指定 `encoding`，例如 `cp1252`、`big5`、`shift_jis` 或无 BOM 的 `utf-16-be`。当自动识别为旧编码、且要把纯 ASCII 片段换成非 ASCII 文本时，工具会要求明确编码。原编码无法表示替换字符时，文件保持原样。
 
 `list_files` 会区分目录没有可见条目和通配符没有命中；`grep` 在没有匹配时报告 0 处匹配。这三种结果都表示工具执行成功。
 
