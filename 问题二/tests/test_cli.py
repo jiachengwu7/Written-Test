@@ -59,6 +59,19 @@ class TerminalTest(unittest.TestCase):
         second = self.run_cli([], "--resume", session.stem, "继续")
         self.assertNotEqual(second.returncode, 0)
 
+    def test_dotenv_home_creates_directory_and_supports_resume(self):
+        self.env_file.write_text("MINI_AGENT_HOME=local/sessions\n", encoding="utf-8")
+        directory = self.env_file.parent / "local" / "sessions"
+        first = self.run_cli([{"content": "已记录"}], "开始")
+        self.assertEqual(first.returncode, 0, first.stderr)
+        self.assertTrue(directory.is_dir())
+        session, = directory.glob("*.json")
+        self.assertTrue(session.with_suffix(".jsonl").is_file())
+        self.assertFalse(self.home.exists())
+        resumed = self.run_cli([{"content": "已恢复"}], "--resume", session.stem, "继续")
+        self.assertEqual(resumed.returncode, 0, resumed.stderr)
+        self.assertIn("已恢复", resumed.stdout)
+
     def test_dotenv_workspace_override_and_resume(self):
         self.env_file.write_text("MINI_AGENT_PROVIDER=mock\nMINI_AGENT_WORKSPACE=new/project\n")
         configured = self.env_file.parent / "new" / "project"

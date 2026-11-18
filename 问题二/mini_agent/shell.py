@@ -10,6 +10,30 @@ import threading
 from pathlib import Path
 
 
+def shell_executable():
+    if os.name == "nt":
+        return os.environ.get("ComSpec") or os.path.join(os.environ["SystemRoot"], "System32", "cmd.exe")
+    return "/bin/sh"
+
+
+def available_compilers(root: Path) -> list[str]:
+    """仅在 PATH 指定的目录中检查已知编译器入口，不启动进程或遍历目录。"""
+    windows = os.name == "nt"
+    directories = [root / (p.strip('"') if windows else p) for p in os.get_exec_path()]
+    names = ["gcc", "clang", "cc", "tcc", "g++", "clang++", "c++"]
+    if windows:
+        names.append("cl")
+    found = []
+    for name in names:
+        filename = name + ".exe" if windows else name
+        for directory in directories:
+            candidate = directory / filename
+            if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+                found.append(name)
+                break
+    return found
+
+
 class _Capture:
     def __init__(self):
         self.prefix = bytearray()
@@ -64,14 +88,14 @@ class _WindowsJob:
             self.kernel.CloseHandle(self.handle)
 
 
-def run(command: str, root: Path, timeout: int) -> tuple[str, bool]:
+def run(command: str, root: Path, timeout: int, expected_stdout: str | None = None) -> tuple[str, bool]:
     windows = os.name == "nt"
     env = {k: v for k, v in os.environ.items() if not k.upper().endswith("API_KEY")}
     job = _WindowsJob() if windows else None
     # Windows 启动进程收到放行字节后才会创建子进程，确保整个进程树都受作业对象管理。
     launcher = (
         "import subprocess,sys; "
-        "sys.exit(subprocess.call(sys.argv[1], shell=True, stdin=subprocess.DEVNULL) "
+        "sys.exit(subprocess.call(sys.argv[1], shell=True, executable=sys.argv[2], stdin=subprocess.DEVNULL) "
         "if sys.stdin.buffer.read(1) == b'1' else 1)"
     )
     streams = [_Capture(), _Capture()]
@@ -80,8 +104,9 @@ def run(command: str, root: Path, timeout: int) -> tuple[str, bool]:
     timed_out = False
     try:
         process = subprocess.Popen(
-            [sys.executable, "-I", "-S", "-c", launcher, command] if windows else command,
+            [sys.executable, "-I", "-S", "-c", launcher, command, shell_executable()] if windows else command,
             shell=not windows, cwd=root, env=env,
+            executable=None if windows else shell_executable(),
             stdin=subprocess.PIPE if windows else subprocess.DEVNULL,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             start_new_session=not windows,
@@ -120,6 +145,16 @@ def run(command: str, root: Path, timeout: int) -> tuple[str, bool]:
                 process.stdout.close()
                 process.stderr.close()
     status = f"命令执行超时（{timeout} 秒）\n" if timed_out else ""
-    result = (f"{status}退出码：{process.returncode}\n标准输出：\n{streams[0].render()}"
+    stdout = streams[0].render()
+    result = (f"{status}退出码：{process.returncode}\n标准输出：\n{stdout}"
               f"\n标准错误：\n{streams[1].render()}")
-    return result, not timed_out and process.returncode == 0
+    ok = not timed_out and process.returncode == 0
+    if ok and expected_stdout is not None:
+        if streams[0].size > len(streams[0].prefix):
+            return "标准输出已截断，无法核验预期结果。请使用断言或缩小输出范围。\n" + result, False
+        actual = stdout.replace("\r\n", "\n").removesuffix("\n")
+        expected = expected_stdout.replace("\r\n", "\n").removesuffix("\n")
+        if actual != expected:
+            return f"验证失败，预期标准输出为 {expected_stdout[:200]!r}。\n{result}", False
+        result = "标准输出符合预期。\n" + result
+    return result, ok

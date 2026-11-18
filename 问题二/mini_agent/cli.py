@@ -170,11 +170,15 @@ def interact(args, engine, session, config=None):
 def main(argv=None):
     args = options(argv)
     session_id = args.resume or uuid.uuid4().hex
-    directory = Path(os.getenv("MINI_AGENT_HOME") or Path.home() / ".mini-code-agent")
     keys = [v for k, v in os.environ.items() if k.upper().endswith("_API_KEY")]
     try:
         source = (args.env_file or Path(".env")).expanduser().resolve()
         config = load_config(source, required=args.env_file is not None)
+        configured_home = (config or {}).get("MINI_AGENT_HOME")
+        if configured_home:
+            directory = source.parent / Path(configured_home).expanduser()
+        else:
+            directory = Path(os.getenv("MINI_AGENT_HOME") or Path.home() / ".mini-code-agent").expanduser()
         if config is not None:
             args.provider = args.provider or config.get("MINI_AGENT_PROVIDER", "mock")
             keys.extend(v for k, v in config.items() if k.upper().endswith("_API_KEY"))

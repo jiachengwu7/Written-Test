@@ -50,6 +50,8 @@ class Grep(Args, title="搜索文本"):
 class RunShell(Args, title="执行命令"):
     command: str = Field(min_length=1, title="命令")
     timeout: int = Field(60, ge=1, le=3600, title="超时时间", description="允许命令运行的最长时间，单位为秒")
+    expected_stdout: str | None = Field(None, title="预期标准输出",
+                                        description="短输出的精确核对值；统一换行格式并忽略末尾一个换行。")
 
 
 _TOOLS = {
@@ -182,25 +184,31 @@ class Tools:
     def _entries(self, start, recursive):
         if not start.is_dir():
             raise ValueError("指定路径必须是目录")
-        for directory, dirs, files in os.walk(start):
-            base = Path(directory)
-            dirs[:] = sorted(d for d in dirs if d not in _IGNORED and not _linked((base / d).lstat()))
-            yield from (base / d for d in dirs)
-            for name in sorted(files):
-                path = base / name
-                if path == self.config_path:
-                    continue
+        pending = [start]
+        while pending:
+            directory = self._path(str(pending.pop().relative_to(self.root)))
+            dirs, files = [], []
+            for path in sorted(directory.iterdir()):
                 info = path.lstat()
-                if not _linked(info) and stat.S_ISREG(info.st_mode):
-                    yield path
-            if not recursive:
-                return
+                # 先排除链接，再区分目录和文件，避免为判断类型而访问链接目标。
+                if _linked(info) or path == self.config_path:
+                    continue
+                if stat.S_ISDIR(info.st_mode) and path.name not in _IGNORED:
+                    dirs.append(path)
+                elif stat.S_ISREG(info.st_mode):
+                    files.append(path)
+            yield from dirs
+            yield from files
+            if recursive:
+                pending.extend(reversed(dirs))
 
     def _list_files(self, path, pattern):
         start, lines = self._path(path), _Lines()
         for item in self._entries(start, bool(pattern)):
             if pattern is None or _matches(item.relative_to(start), pattern):
                 lines.add(item.relative_to(self.root).as_posix() + ("/" if item.is_dir() else ""))
+        if not lines.count:
+            return ("当前目录没有可列出的条目。" if pattern is None else "没有文件或目录匹配该模式。"), True
         return lines.render(), True
 
     def _read_file(self, path, start_line, end_line):
@@ -212,9 +220,12 @@ class Tools:
         total = 0
         with target.open(encoding="utf-8-sig") as handle:
             for total, line in enumerate(handle, 1):
-                if total >= start_line and (end_line is None or total <= end_line):
+                if total >= start_line:
                     lines.add(f"{total}: {line.rstrip(chr(10))}")
-        return lines.render(total, "可用 start_line 和 end_line 按行号范围继续读取。"), True
+                if total == end_line:
+                    break
+        count = total if end_line is None else lines.count
+        return lines.render(count, "可用 start_line 和 end_line 按行号范围继续读取。"), True
 
     def _grep(self, pattern, path, glob):
         regex, start, lines = re.compile(pattern), self._path(path), _Lines()
@@ -230,7 +241,7 @@ class Tools:
                     text = raw.decode("utf-8-sig", errors="replace").rstrip("\r\n")
                     if regex.search(text):
                         lines.add(f"{item.relative_to(self.root).as_posix()}:{number}: {text}")
-        return lines.render(), True
+        return lines.render() or "搜索完成，0 处匹配。", True
 
     def _original(self, target):
         if not target.exists():
@@ -280,7 +291,7 @@ class Tools:
             raise ValueError("old_string 匹配了多个位置")
         return self._replace(path, original, text.replace(old_string, new_string, 1))
 
-    def _run_shell(self, command, timeout):
+    def _run_shell(self, command, timeout, expected_stdout=None):
         if not self.confirm(f"在 {self.root} 中执行命令\n{command}"):
             return "用户拒绝了此次操作", False
-        return run(command, self.root, timeout)
+        return run(command, self.root, timeout, expected_stdout)

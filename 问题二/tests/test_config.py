@@ -46,4 +46,4 @@ class ConfigTests(unittest.TestCase):
         self.path.write_text("OPENAI_API_KEY=secret")
         tools = Tools(self.path.parent, lambda _: True, config_path=self.path.resolve())
         self.assertFalse(tools.execute("read_file", '{"path":".env"}')[1])
-        self.assertEqual(tools.execute("grep", '{"pattern":"secret"}'), ("", True))
+        self.assertEqual(tools.execute("grep", '{"pattern":"secret"}'), ("搜索完成，0 处匹配。", True))

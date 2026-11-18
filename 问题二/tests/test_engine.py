@@ -1,7 +1,17 @@
 import copy
+import json
+import os
+import platform
+import shlex
+import subprocess
+import sys
+import tempfile
 import unittest
+from pathlib import Path
+from unittest.mock import patch
 
 from mini_agent.engine import Engine, INTERRUPTED, SYSTEM, _cost, _summary
+from mini_agent.tools import Tools as WorkspaceTools
 
 
 def call(i, name="read_file", args='{"path":"a"}'):
@@ -30,6 +40,7 @@ class Provider:
 
 class Tools:
     schemas = []
+    root = Path.cwd()
 
     def __init__(self, interrupt_at=0):
         self.attempts = []
@@ -93,7 +104,7 @@ class EngineTests(unittest.TestCase):
         self.assertEqual(recovered.turn("检查状态"), "已继续")
         assert_legal(self, recovered.provider.requests[0])
         self.assertFalse(recovered.tools.attempts)
-        self.assertEqual(recovered.provider.requests[0][0]["content"], SYSTEM)
+        self.assertEqual(recovered.provider.requests[0][0], engine.history[0])
 
     def test_partial_stream_discarded_on_interrupt(self):
         engine = self.make([KeyboardInterrupt(), reply(text="就绪")])
@@ -103,6 +114,60 @@ class EngineTests(unittest.TestCase):
         self.assertNotIn("已接收的部分回复", str(engine.history))
         engine.turn("再来一次")
         assert_legal(self, engine.history)
+
+    def test_runtime_and_scope_survive_restore_and_compaction(self):
+        with tempfile.TemporaryDirectory() as folder:
+            tools = WorkspaceTools(Path(folder), lambda _: True)
+            history = [{"role": "system", "content": "旧环境"},
+                       {"role": "user", "content": "旧任务"}, reply(text="x" * 100000)]
+            engine = self.make([reply(text="完成")], tools=tools, history=history)
+            engine.turn("实现 BFS")
+            messages = engine.provider.requests[0]
+            self.assertTrue(any(event == "compaction" for event, _ in self.events))
+            prompt = messages[0]["content"]
+            for item in (platform.system(), json.dumps(str(tools.root), ensure_ascii=False),
+                         "最小可运行", "预期结果", "同一"):
+                self.assertIn(item, prompt)
+            self.assertIn("cmd" if os.name == "nt" else "/bin/sh", prompt.lower())
+            self.assertNotIn("旧环境", prompt)
+
+    def test_compiler_snapshot_is_reused_and_refreshed_on_resume(self):
+        with tempfile.TemporaryDirectory() as folder, patch.dict(os.environ, {"PATH": folder}):
+            binary = Path(folder) / ("clang.exe" if os.name == "nt" else "clang")
+            binary.touch()
+            binary.chmod(0o755)
+            engine = self.make([reply(text="完成"), reply(text="完成")])
+            binary.unlink()
+            engine.turn("实现 BFS")
+            engine.turn("实现 DFS")
+            for request in engine.provider.requests:
+                runtime = json.loads(request[0]["content"].split("运行环境：")[-1])
+                self.assertEqual(["clang"], runtime.get("PATH 中的 C/C++ 编译器"))
+            recovered = self.make([reply(text="完成")], history=engine.history)
+            recovered.turn("继续")
+            prompt = recovered.provider.requests[0][0]["content"]
+            self.assertEqual([], json.loads(prompt.split("运行环境：")[-1])["PATH 中的 C/C++ 编译器"])
+            self.assertIn("未编译验证", prompt)
+
+    def test_wrong_output_then_edit_and_repeat_same_check(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            (root / "demo.py").write_text("print(1)", encoding="utf-8")
+            argv = [sys.executable, "demo.py"]
+            cmd = subprocess.list2cmdline(argv) if os.name == "nt" else shlex.join(argv)
+            check = json.dumps({"command": cmd, "expected_stdout": "5"})
+            fix = json.dumps({"path": "demo.py", "old_string": "print(1)", "new_string": "print(5)"})
+            engine = self.make([reply(call(1, "run_shell", check)), reply(call(2, "edit_file", fix)),
+                                reply(call(3, "run_shell", check)), reply(text="复测通过")],
+                               tools=WorkspaceTools(root, lambda _: True))
+            engine.turn("验证示例的输出应为 5")
+            failure = engine.provider.requests[1][-1]
+            self.assertFalse(failure["ok"])
+            self.assertIn("退出码：0", failure["content"])
+            self.assertIn("预期", failure["content"])
+            self.assertIn("标准输出：\n1", failure["content"])
+            self.assertTrue(engine.provider.requests[3][-1]["ok"])
+            assert_legal(self, engine.history)
 
     def test_limit_and_textual_and_truncated_tool_call(self):
         engine = self.make([

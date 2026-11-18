@@ -100,30 +100,83 @@ class ToolTests(unittest.TestCase):
         result, ok = self.call("read_file", path="big", start_line=50000)
         self.assertEqual((f"50000: {'a' * 99}", True), (result, ok))
 
-    def test_workspace_paths(self):
-        for path in ["../outside", str(self.outer / "outside"), r"C:\Windows\test", r"..\outside"]:
-            self.assertFalse(self.call("write_file", path=path, content="no")[1], path)
-        self.assertFalse((self.outer / "outside").exists())
+    def test_explicit_end_line_does_not_scan_the_tail(self):
+        (self.root / "log").write_bytes(b"first\nsecond\n" + b"x\n" * 50000 + b"\xff")
+        self.assertEqual(("2: second", True),
+                         self.call("read_file", path="log", start_line=2, end_line=2))
 
-    def test_directory_link_excluded_from_all_access(self):
+    def test_bounded_read_truncation_counts_requested_lines(self):
+        (self.root / "log").write_bytes(b"x\n" * 1000)
+        text, ok = self.call("read_file", path="log", start_line=51, end_line=300)
+        self.assertTrue(ok)
+        self.assertIn("250 行", text)
+        self.assertIn("已截断", text)
+
+    def test_empty_results_explain_what_was_searched(self):
+        self.assertEqual(("当前目录没有可列出的条目。", True), self.call("list_files"))
+        (self.root / "a.txt").write_text("example", encoding="utf-8")
+        self.assertEqual(("没有文件或目录匹配该模式。", True), self.call("list_files", pattern="*.py"))
+        self.assertEqual(("搜索完成，0 处匹配。", True), self.call("grep", pattern="absent"))
+
+    def assert_file_tools_reject(self, directory, filename, reason):
+        for tool, path, args in [
+            ("list_files", directory, {}),
+            ("grep", directory, {"pattern": "marker"}),
+            ("read_file", filename, {}),
+            ("write_file", filename, {"content": "changed"}),
+            ("edit_file", filename, {"old_string": "marker", "new_string": "changed"}),
+        ]:
+            with self.subTest(tool=tool, path=path):
+                message, ok = self.call(tool, path=path, **args)
+                self.assertFalse(ok)
+                self.assertIn(reason, message)
+        self.assertEqual([], self.prompts)
+
+    def test_workspace_paths(self):
+        outside = self.outer / "outside"
+        outside.mkdir()
+        marker = outside / "file"
+        marker.write_bytes(b"marker")
+        for directory in ["../outside", r"..\outside", str(outside), str(self.root),
+                          r"C:\Windows", r"C:relative", r"\\server\share"]:
+            self.assert_file_tools_reject(directory, directory + "/file", "工作区内的相对路径")
+        self.assertEqual(b"marker", marker.read_bytes())
+
+    def check_external_link(self, kind):
         elsewhere = self.outer / "outside"
         elsewhere.mkdir()
-        (elsewhere / "secret").write_text("marker")
+        marker = elsewhere / "secret"
+        marker.write_bytes(b"marker")
         link = self.root / "link"
-        try:
-            link.symlink_to(elsewhere, target_is_directory=True)
-        except OSError as exc:
-            if os.name != "nt":
+        if kind == "junction":
+            subprocess.run(["cmd", "/c", "mklink", "/J", str(link), str(elsewhere)],
+                           capture_output=True, check=True)
+        else:
+            try:
+                link.symlink_to(marker if kind == "file" else elsewhere, target_is_directory=kind == "directory")
+            except OSError as exc:
+                if getattr(exc, "winerror", None) == 1314:
+                    self.skipTest("创建 Windows 符号链接需要开发者模式或相应权限")
                 raise
-            result = subprocess.run(["cmd", "/c", "mklink", "/J", str(link), str(elsewhere)],
-                                    capture_output=True)
-            if result.returncode:
-                self.skipTest(f"当前环境无法创建符号链接或目录联接（{exc}）")
-        self.assertFalse(self.call("read_file", path="link/secret")[1])
-        self.assertFalse(self.call("write_file", path="link/new", content="bad")[1])
-        self.assertEqual(("", True), self.call("list_files", pattern="**/*"))
-        self.assertEqual(("", True), self.call("grep", pattern="marker"))
+        target = "link" if kind == "file" else "link/secret"
+        self.assert_file_tools_reject("link", target, "符号链接或重解析点")
+        if kind != "file":
+            self.assertFalse(self.call("write_file", path="link/new", content="bad")[1])
+        (self.root / "visible").write_bytes(b"marker")
+        self.assertEqual(("visible", True), self.call("list_files", pattern="**/*"))
+        self.assertEqual(("visible:1: marker", True), self.call("grep", pattern="marker"))
         self.assertFalse((elsewhere / "new").exists())
+        self.assertEqual(b"marker", marker.read_bytes())
+
+    def test_file_symlink_is_excluded(self):
+        self.check_external_link("file")
+
+    def test_directory_symlink_is_excluded(self):
+        self.check_external_link("directory")
+
+    @unittest.skipUnless(os.name == "nt", "目录联接仅适用于 Windows")
+    def test_windows_junction_is_excluded(self):
+        self.check_external_link("junction")
 
     def test_shell_captures_both_streams_status_and_limits(self):
         code = ("import os,sys; print('x'*50000); "
@@ -135,6 +188,19 @@ class ToolTests(unittest.TestCase):
         self.assertIn("标准错误：\nremoved", result)
         self.assertIn("已截断，共 1 行", result)
         self.assertLess(len(result), 7000)
+
+    def test_shell_expected_output_requires_complete_stdout_and_zero_exit(self):
+        for code, expected, reason in [
+            ("print('a' * 6001)", "a" * 6000, "无法核验"),
+            ("import sys; print(1); sys.exit(7)", "1", "退出码：7"),
+            ("import sys; print(1, file=sys.stderr)", "1", "验证失败"),
+            ("print('a ')", "a", "验证失败"),
+        ]:
+            with self.subTest(code=code):
+                result, ok = self.call("run_shell", command=python_command("-c", code),
+                                       expected_stdout=expected)
+                self.assertFalse(ok)
+                self.assertIn(reason, result)
 
     def test_timeout_and_interrupt_terminate_grandchild(self):
         (self.root / "child.py").write_text(
