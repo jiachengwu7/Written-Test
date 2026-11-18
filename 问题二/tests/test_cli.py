@@ -4,6 +4,7 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from unittest.mock import Mock, patch
 
@@ -24,12 +25,13 @@ class TerminalTest(unittest.TestCase):
         self.env = dict(os.environ, MINI_AGENT_HOME=str(self.home), PYTHONUTF8="1",
                         MINI_AGENT_API_KEY="test-secret-for-redaction")
 
-    def run_cli(self, script, *args, stdin=""):
+    def run_cli(self, script, *args, stdin="", **process_options):
         self.script.write_text(json.dumps(script), encoding="utf-8")
         return subprocess.run(
             [sys.executable, "-m", "mini_agent", "--workspace", str(self.workspace),
              "--env-file", str(self.env_file), "--provider", "mock", "--mock-script", str(self.script), *args],
-            input=stdin, env=self.env, encoding="utf-8", capture_output=True, timeout=20)
+            input=stdin, env=self.env, encoding="utf-8", capture_output=True, timeout=20,
+            **process_options)
 
     def test_approval_resume_and_log_redaction(self):
         script = [{"calls": [{"id": "a", "name": "write_file",
@@ -149,3 +151,37 @@ class TerminalTest(unittest.TestCase):
         with patch("builtins.input", side_effect=["第一个任务", "第二个任务", KeyboardInterrupt()]):
             self.assertEqual(interact(options([]), engine, Mock()), 0)
         self.assertEqual([call.args for call in engine.turn.call_args_list], [("第一个任务",), ("第二个任务",)])
+
+    @unittest.skipUnless(os.name == "nt", "验证 Windows 控制台的 Ctrl+C 事件")
+    def test_console_ctrl_c_stops_slow_shell_and_accepts_next_task(self):
+        # 在 CLI 的专用控制台中发送真实事件，避免中断运行测试的终端。
+        (self.workspace / "child.py").write_text(
+            "import ctypes, os, time\nfrom pathlib import Path\n"
+            "kernel = ctypes.windll.kernel32\n"
+            "members = (ctypes.c_ulong * 64)()\n"
+            "n = kernel.GetConsoleProcessList(members, len(members))\n"
+            f"assert 0 < n <= len(members) and {os.getpid()} not in members[:n]\n"
+            "Path('sent').write_text(str(time.monotonic()))\n"
+            "assert kernel.GenerateConsoleCtrlEvent(0, 0)\n"
+            "time.sleep(4)\nPath('child_finished').touch()\n", encoding="utf-8")
+        (self.workspace / "parent.py").write_text(
+            "import subprocess, sys\nfrom pathlib import Path\n"
+            "subprocess.run([sys.executable, 'child.py'], check=True)\n"
+            "Path('parent_finished').touch()\n", encoding="utf-8")
+        command = subprocess.list2cmdline([sys.executable, "parent.py"])
+        script = [{"calls": [{"id": "slow", "name": "run_shell", "arguments": {"command": command}}]},
+                  {"content": "已执行第二项任务"}]
+        info = subprocess.STARTUPINFO()
+        info.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        info.wShowWindow = 0
+        result = self.run_cli(script, "--yes", stdin="运行慢命令\n继续验证\n/exit\n",
+                              creationflags=subprocess.CREATE_NEW_CONSOLE, startupinfo=info)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("本轮已取消", result.stdout)
+        self.assertIn("任务> ", result.stdout.split("本轮已取消", 1)[1])
+        self.assertIn("已执行第二项任务", result.stdout.split("本轮已取消", 1)[1])
+        elapsed = time.monotonic() - float((self.workspace / "sent").read_text())
+        self.assertLess(elapsed, 2.5, "收到 Ctrl+C 后应在慢命令结束前处理下一项任务")
+        time.sleep(max(0, 4.2 - elapsed))
+        self.assertFalse((self.workspace / "child_finished").exists())
+        self.assertFalse((self.workspace / "parent_finished").exists())

@@ -7,6 +7,7 @@ import signal
 import subprocess
 import sys
 import threading
+import time
 from pathlib import Path
 
 
@@ -88,6 +89,21 @@ class _WindowsJob:
             self.kernel.CloseHandle(self.handle)
 
 
+def _wait_for_exit(process, timeout):
+    if os.name != "nt":
+        return process.wait(timeout=timeout)
+    # Windows 的句柄等待会推迟 Python 信号处理，分段等待让主线程及时响应 Ctrl+C。
+    deadline = time.monotonic() + timeout
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0.1:
+            return process.wait(timeout=max(0, remaining))
+        try:
+            return process.wait(timeout=0.1)
+        except subprocess.TimeoutExpired:
+            continue
+
+
 def run(command: str, root: Path, timeout: int, expected_stdout: str | None = None) -> tuple[str, bool]:
     windows = os.name == "nt"
     env = {k: v for k, v in os.environ.items() if not k.upper().endswith("API_KEY")}
@@ -121,7 +137,7 @@ def run(command: str, root: Path, timeout: int, expected_stdout: str | None = No
             worker.start()
             workers.append(worker)
         try:
-            process.wait(timeout=timeout)
+            _wait_for_exit(process, timeout)
         except subprocess.TimeoutExpired:
             timed_out = True
     finally:
