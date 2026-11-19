@@ -16,6 +16,7 @@
   - [3.1 模块划分](#31-模块划分)
   - [3.2 内部消息格式](#32-内部消息格式)
   - [3.3 Provider 抽象与流式重试](#33-provider-抽象与流式重试)
+    - [3.3.1 跨协议工具调用的设计与验证](#331-跨协议工具调用的设计与验证)
   - [3.4 工具、授权与输出](#34-工具授权与输出)
 - [4. 第四章必做题与加分项](#4-第四章必做题与加分项)
   - [4.1 上下文溢出与消息合法性](#41-上下文溢出与消息合法性)
@@ -857,6 +858,38 @@ mini_code_agent/
 5. **哪些失败会重试。** 网络超时、HTTP 429、HTTP 5xx，以及响应流提前结束或事件解析失败，会重新发送本次模型请求。含首次请求在内最多尝试三次，两次重试前分别等待 1 秒和 2 秒。HTTP 400、401 等其他 HTTP 错误直接报告。失败尝试中已经显示的文本会留在终端，重试成功后可能再次看到相同开头。
 
 6. **离线 Mock 如何复用引擎。** 默认 Mock 先返回一次 `list_files` 调用，收到真实工具结果后再生成演示答复。指定 `--mock-script` 时，每次调用 `complete` 消耗脚本中的一条预设回复。测试由此可以稳定复现多工具调用、截断和异常参数，同时走实际的引擎与工具执行流程。
+
+#### 3.3.1 跨协议工具调用的设计与验证
+
+1. **为什么单换 `base_url` 不够？** 假设模型在一条回复中要求读文件并搜索文本。OpenAI Chat Completions 把两个调用放进助手的 `tool_calls` 数组，随后要接收两条独立的 `tool` 消息。Anthropic Messages 把调用和正文都放进助手的 `content` 块列表，两个结果要作为 `tool_result` 块放回随后的一条 `user` 消息。如果直接保存第一种请求体，再原样发给第二种接口，结果的角色、参数类型和关联字段都与目标协议不符。为此，会话把“一次调用及其结果”作为需要保存的事实，把“这段历史如何发送”交给当前 Provider。
+
+2. **统一消息保留什么？** 助手用 `calls` 列表记录每次调用的 `id`、`name` 和原始 `arguments` 字符串。工具每完成一次就写入一条结果，包含同一 `id`、成功标记 `ok` 和正文 `content`。按 ID 配对可以区分同一批中两次同名调用。保留参数原文还允许工具层报告 JSON 解析错误，即使第二个调用失败，第一个调用的结果仍然有效。
+
+3. **Provider 如何把两端接起来？** 收到模型响应时，`openai_stream` 和 `anthropic_stream` 分别拼接各自的流式片段，向 `Engine.turn` 返回同一种助手消息。引擎通过 `provider.complete(...)` 取得回复，遍历 `calls`，按工具名和参数调度，并把结果按 ID 写回历史。下一次请求由 `openai_request` 或 `anthropic_request` 将这份历史转换成当前协议。中途执行 `/model` 后，新 Provider 可以重建之前的调用和结果，已经完成的工具无需再执行。
+
+4. **用同一批调用验证转换。** 回归用例 `test_history_conversion_groups_parallel_results_in_order` 构造两个调用，`a` 读取文件成功，`b` 的搜索参数只有一个左花括号，结果为“JSON 无效”。两种适配器生成的**结果消息**如下，顺序都与原调用一致。
+
+   **OpenAI Chat Completions API** 通过两条消息的 `tool_call_id` 回填结果，失败原因保存在正文中。
+
+   ```json
+   [
+     {"role":"tool","tool_call_id":"a","content":"成功"},
+     {"role":"tool","tool_call_id":"b","content":"JSON 无效"}
+   ]
+   ```
+
+   **Anthropic Messages API** 通过同一条消息中两个块的 `tool_use_id` 回填结果，第二个块还标记了 `is_error`。重建历史调用时，适配器用 `{"_invalid_arguments":"{"}` 保存原始坏参数，使 `tool_use.input` 仍为对象。
+
+   ```json
+   [
+     {"role":"user","content":[
+       {"type":"tool_result","tool_use_id":"a","content":"成功","is_error":false},
+       {"type":"tool_result","tool_use_id":"b","content":"JSON 无效","is_error":true}
+     ]}
+   ]
+   ```
+
+5. **抽象的边界在哪里？** 新协议可以复用工具调度、审批、结果配对和会话持久化，只需为正常调用提供请求转换和响应解析。当前引擎在异常处理上仍识别两种原始截断原因 `length`、`max_tokens`，也会识别正文里误写的 `tool_calls`、`tool_use` 来提示模型重发。接入第三种协议时，还需核对这两处规则。
 
 ### 3.4 工具、授权与输出
 
