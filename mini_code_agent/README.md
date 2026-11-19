@@ -1105,16 +1105,58 @@ uv run --frozen python -m unittest discover -s tests -t . -v
 
 ### 6.2 沙箱、精确编辑与三项必做题的测试覆盖
 
-需要定位某个验收项时，可单独运行表中的代表用例。
+在项目目录运行下表中的 PowerShell 命令。每条命令都可以整段复制；行末的反引号是 PowerShell 的续行符。使用 Bash 时，将行末的反引号换成反斜杠（`\`）。`-k` 按名称筛选用例，多个 `-k` 匹配其中任意一项。
 
-| 验收项 | 单独运行 | 检查内容 |
-| --- | --- | --- |
-| 沙箱路径校验 | `uv run --frozen python -m unittest -v tests.test_tools.ToolTests.test_workspace_paths` | 五个文件工具拒绝父目录、绝对路径、盘符和 UNC 路径；全套另测文件符号链接、目录符号链接和 Windows 目录联接。 |
-| 精确编辑 | `uv run --frozen python -m unittest -v tests.test_tools.ToolTests.test_denied_and_ambiguous_edits_do_not_modify` | 验证原文不存在、重叠匹配或用户拒绝时文件保持原样；全套另测 BOM、混合换行与编码错误。 |
-| 4.1 上下文压缩 | `uv run --frozen python -m unittest -v tests.test_engine.EngineTests.test_compaction_cut_inside_parallel_results` | 把预算设在同批两个工具结果之间，检查调用与结果整批取舍；全套另测 5 MB 文件续读和跨轮待办。 |
-| 4.2 中断与恢复 | `uv run --frozen python -m unittest -v tests.test_engine.EngineTests.test_cancel_three_calls_and_resume_from_crash_checkpoint` | 在三个调用中只完成一个时恢复，检查剩余结果和下一轮消息是否合法；全套另测 CLI 恢复和进程树清理。 |
-| 4.3 异常与循环 | `uv run --frozen python -m unittest -v tests.test_engine.EngineTests.test_limit_and_textual_and_truncated_tool_call tests.test_engine.EngineTests.test_repeated_cycles_length_one_two_three` | 验证截断请求、写在文本中的调用，以及长度为一、二、三的动作序列重复；全套另测未知工具、缺字段和类型错误。 |
-| 4.4.3 文件提示注入 | `uv run --frozen python -m unittest -v tests.test_engine.EngineTests.test_file_instructions_stay_in_tool_result_and_shell_requires_approval` | 检查消息角色、拒绝审批后的工具结果，以及临时目录没有生成标记文件。 |
+<table>
+<thead>
+<tr><th>验收项</th><th>单独运行（PowerShell）</th><th>检查内容</th></tr>
+</thead>
+<tbody>
+<tr>
+<td>沙箱路径校验</td>
+<td><pre><code>uv run --frozen python -m unittest -v `
+  tests.test_tools `
+  -k test_workspace_paths</code></pre></td>
+<td>五个文件工具拒绝父目录、绝对路径、盘符和 UNC 路径。全套另测文件符号链接、目录符号链接和 Windows 目录联接。</td>
+</tr>
+<tr>
+<td>精确编辑</td>
+<td><pre><code>uv run --frozen python -m unittest -v `
+  tests.test_tools `
+  -k denied_and_ambiguous_edits</code></pre></td>
+<td>原文不存在、匹配重叠或用户拒绝时保留原文件。全套另测 BOM、混合换行与编码错误。</td>
+</tr>
+<tr>
+<td>4.1 上下文压缩</td>
+<td><pre><code>uv run --frozen python -m unittest -v `
+  tests.test_engine `
+  -k compaction_cut_inside_parallel_results</code></pre></td>
+<td>把预算设在同批两个工具结果之间，检查调用和结果能否整批取舍。全套另测 5 MB 文件续读和跨轮待办。</td>
+</tr>
+<tr>
+<td>4.2 中断与恢复</td>
+<td><pre><code>uv run --frozen python -m unittest -v `
+  tests.test_engine `
+  -k cancel_three_calls_and_resume</code></pre></td>
+<td>三个调用只完成一个时恢复会话，检查剩余结果和下一轮消息的合法性。全套另测 CLI 恢复和进程树清理。</td>
+</tr>
+<tr>
+<td>4.3 异常与循环</td>
+<td><pre><code>uv run --frozen python -m unittest -v `
+  tests.test_engine `
+  -k textual_and_truncated_tool_call `
+  -k repeated_cycles_length_one_two_three</code></pre></td>
+<td>第一项检查截断请求和写在正文中的调用，第二项检查长度为一、二、三的重复动作序列。全套另测未知工具、缺字段和类型错误。</td>
+</tr>
+<tr>
+<td>4.4.3 文件提示注入</td>
+<td><pre><code>uv run --frozen python -m unittest -v `
+  tests.test_engine `
+  -k file_instructions_stay_in_tool_result</code></pre></td>
+<td>检查文件内容的消息角色、拒绝审批后的工具结果，以及临时目录中是否生成标记文件。</td>
+</tr>
+</tbody>
+</table>
 
 **真实 Anthropic 模型验收**单独运行。在项目目录的 `.env` 中配置 `ANTHROPIC_MODEL`、`ANTHROPIC_BASE_URL` 和 `ANTHROPIC_API_KEY`。这条命令会调用配置的服务并消耗 token。测试在临时工作目录创建合成报告；默认离线测试命令不会触发此次请求。
 
