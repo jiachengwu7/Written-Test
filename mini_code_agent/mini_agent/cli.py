@@ -85,7 +85,8 @@ def build_provider(args, name, model, config=None):
     url = url or settings.get(prefix + "_BASE_URL")
     model = model or (settings.get("MINI_AGENT_MODEL") if startup else None) or settings.get(prefix + "_MODEL")
     if name != "mock" and not model:
-        raise ValueError(f"请在 .env 的 {prefix}_MODEL 中填写模型名，或使用 --model 指定")
+        raise ValueError(f"请在 .env 的 {prefix}_MODEL 中填写模型名，或在启动时用 --model、"
+                         f"在会话中用 /model {name} <模型名> 指定")
     script = None
     if name == "mock" and args.mock_script:
         script = json.loads(args.mock_script.read_text(encoding="utf-8-sig"))
@@ -142,12 +143,14 @@ def interact(args, engine, session, config=None):
                 return 0
             if task.split()[0] == "/model":
                 parts = task.split()
-                if len(parts) != 3 or parts[1] not in ("openai", "anthropic", "mock"):
-                    print("用法 /model <openai|anthropic|mock> <模型名>")
+                if len(parts) not in (2, 3) or parts[1] not in ("openai", "anthropic", "mock"):
+                    print("用法 /model <openai|anthropic|mock> [模型名]，省略模型名时使用配置中的默认值")
                     continue
+                name = parts[1]
+                model = parts[2] if len(parts) == 3 else None
                 try:
-                    engine.provider = build_provider(args, parts[1], parts[2], config)
-                    print("当前模型", parts[1], parts[2])
+                    engine.provider = build_provider(args, name, model, config)
+                    print("当前模型", name, getattr(engine.provider, "model", model or "mock"))
                 except (ValueError, OSError, RuntimeError) as exc:
                     print(session.redact(str(exc)), file=sys.stderr)
                 continue

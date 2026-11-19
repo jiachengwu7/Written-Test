@@ -61,6 +61,24 @@ class TerminalTest(unittest.TestCase):
         second = self.run_cli([], "--resume", session.stem, "继续")
         self.assertNotEqual(second.returncode, 0)
 
+    def test_model_switch_defaults_override_and_reset(self):
+        settings = ("OPENAI_MODEL=openai-default\nOPENAI_API_KEY=local-test\n"
+                    "ANTHROPIC_MODEL=anthropic-default\nANTHROPIC_API_KEY=local-test\n")
+        self.env_file.write_text(settings, encoding="utf-8")
+        result = self.run_cli([], stdin="/model anthropic\n/model anthropic custom\n"
+                              "/model openai\n/model anthropic\n/model mock\n/exit\n")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.count("当前模型 anthropic anthropic-default"), 2)
+        for line in ("当前模型 anthropic custom", "当前模型 openai openai-default", "当前模型 mock mock"):
+            self.assertIn(line, result.stdout)
+        self.assertEqual(self.env_file.read_text(encoding="utf-8"), settings)
+
+    def test_missing_default_leaves_current_model_active(self):
+        result = self.run_cli([{"content": "原会话可用"}], stdin="/model anthropic\n继续\n/exit\n")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("ANTHROPIC_MODEL", result.stderr)
+        self.assertIn("原会话可用", result.stdout)
+
     def test_dotenv_home_creates_directory_and_supports_resume(self):
         self.env_file.write_text("MINI_AGENT_HOME=local/sessions\n", encoding="utf-8")
         directory = self.env_file.parent / "local" / "sessions"

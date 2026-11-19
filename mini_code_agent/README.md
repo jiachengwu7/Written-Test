@@ -17,6 +17,7 @@
   - [3.2 内部消息格式](#32-内部消息格式)
   - [3.3 Provider 抽象与流式重试](#33-provider-抽象与流式重试)
     - [3.3.1 跨协议工具调用的设计与验证](#331-跨协议工具调用的设计与验证)
+    - [3.3.2 流式响应、重试与离线验证](#332-流式响应重试与离线验证)
   - [3.4 工具、授权与输出](#34-工具授权与输出)
 - [4. 第四章必做题与加分项](#4-第四章必做题与加分项)
   - [4.1 上下文溢出与消息合法性](#41-上下文溢出与消息合法性)
@@ -762,6 +763,8 @@ PASS\r
 
 ## 3. 架构与消息流
 
+一次任务从命令行进入 `Engine.turn`。引擎将历史和工具定义交给 Provider，收到工具请求后调用本地工具，再把结果写回历史。模型给出最终答复后，终端显示本轮用量。下面沿这条路径说明各模块的职责。
+
 ### 3.1 模块划分
 
 ```text
@@ -775,12 +778,13 @@ mini_code_agent/
 │   ├── tools.py               # 校验工具参数、检查文件路径、预览和执行文件修改
 │   ├── shell.py               # 执行命令，管理超时和子进程树，核对标准输出
 │   └── storage.py             # 保存会话快照、写入脱敏日志，用文件锁协调访问
-├── tests/                     # 无需模型密钥的自动化测试
+├── tests/                     # 离线回归测试与可单独运行的真实模型验收
 │   ├── test_cli.py            # 命令行启动、交互、模型切换与会话恢复
 │   ├── test_config.py         # 配置文件解析与错误处理
 │   ├── test_engine.py         # 上下文压缩、中断恢复、异常输出与死循环检测
 │   ├── test_providers.py      # 协议转换、流式响应与重试
-│   └── test_tools.py          # 文件沙箱、精确编辑与命令执行
+│   ├── test_tools.py          # 文件沙箱、精确编辑与命令执行
+│   └── live_anthropic.py      # 显式运行的 Anthropic 模型验收，需要配置密钥
 ├── .env.example               # 模型、工作目录和会话目录的配置模板
 ├── pyproject.toml             # 项目依赖与 mini-code-agent 命令入口
 ├── uv.lock                    # 锁定依赖版本
@@ -789,124 +793,89 @@ mini_code_agent/
 
 ### 3.2 内部消息格式
 
-1. **一轮对话如何记录。** 引擎用一个按时间排序的消息列表保存历史。每条消息都有 `role` 和 `content`。一次用户输入可能产生多条消息：模型先提出工具调用，引擎写入工具结果，再把更新后的历史交给模型生成答复。
+以“读取 hello.txt 的第一行”为例。用户只输入一次任务，引擎依次记录用户请求、助手提出的工具调用、工具返回的结果，以及助手根据结果给出的答复。下面省略系统提示和用量字段。
 
-2. **四种角色各自记录什么。**
+```json
+[
+  {"role":"user","content":"读取 hello.txt 的第一行"},
+  {"role":"assistant","content":"","calls":[
+    {"id":"r1","name":"read_file","arguments":"{\"path\":\"hello.txt\",\"end_line\":1}"}
+  ]},
+  {"role":"tool","id":"r1","ok":true,"content":"1: 你好"},
+  {"role":"assistant","content":"hello.txt 的第一行是“你好”。","calls":[]}
+]
+```
 
-   | `role` | 写入的内容 |
-   | --- | --- |
-   | `system` | Agent 的执行规则和运行环境，例如工作目录、操作系统和 Shell。 |
-   | `user` | 用户输入的任务或追问。模型输出被截断或把工具调用写成普通文本时，引擎也用该角色提示模型继续或纠正。 |
-   | `assistant` | 模型返回的正文在 `content` 中，请求执行的工具在 `calls` 中。如果仅发起调用，正文可以为空。 |
-   | `tool` | 一次调用的结果。`id` 指向原调用，`ok` 表示成功或失败，`content` 保存结果文本或错误原因。 |
+| 角色 | 记录什么 | 引擎如何使用 |
+| --- | --- | --- |
+| `system` | 执行规则、工作目录、操作系统和 Shell | 给模型提供本轮任务的运行环境。 |
+| `user` | 用户任务、追问，或引擎要求模型纠正异常输出的提示 | 发起或继续一轮对话。 |
+| `assistant` | 正文 `content` 和工具调用列表 `calls` | 每个调用分别记录 `id`、`name` 和参数原文 `arguments`。参数保留为字符串，工具层可以报告 JSON 截断的具体错误。 |
+| `tool` | 调用 `id`、是否成功 `ok`、结果或错误正文 `content` | 按 ID 配对。即使同批两次调用同一个工具，结果也各有归属。 |
 
-3. **工具调用如何配对。** `calls` 是数组，其中每项包含调用标识 `id`、工具名 `name` 和参数字符串 `arguments`。即使同一批里两次调用 `read_file`，引擎也能用不同的 ID 将结果对应到各自的请求。参数保留为字符串，工具层才能识别不完整的 JSON，并为该 ID 返回具体错误。
-
-4. **读一次文件的完整往返。** 以下示例按写入会话历史的顺序展示与调用有关的字段。第三条消息中的 `r1` 对应第二条消息的调用；第四条是模型读到结果后给用户的答复。
-
-   ```json
-   [
-     {"role": "user", "content": "读取 hello.txt 的第一行"},
-     {
-       "role": "assistant",
-       "content": "",
-       "calls": [
-         {"id": "r1", "name": "read_file", "arguments": "{\"path\":\"hello.txt\",\"end_line\":1}"}
-       ]
-     },
-     {"role": "tool", "id": "r1", "ok": true, "content": "1: 你好"},
-     {"role": "assistant", "content": "hello.txt 的第一行是“你好”。", "calls": []}
-   ]
-   ```
-
-5. **结束原因与用量。** Provider 返回的助手消息还包含 `finish`、`input_tokens` 和 `output_tokens`。例如，`finish` 为 `length` 或 `max_tokens` 时，即使已经出现工具名，引擎也会跳过这批调用，以免执行截断的参数。每轮结束时，终端显示该轮各次模型回复的累计用量。
-
-6. **为什么会话保存一份内部历史。** 用户切换模型后，下一轮仍要知道哪个工具执行过、用了什么参数、结果是否成功。OpenAI 兼容接口用独立的 `tool` 消息返回结果，Anthropic 兼容接口把结果放进 `user` 消息的内容块。如果直接把前一个接口的请求体交给后一个接口，工具结果的角色和位置就会出错。因此，快照保存调用 ID、工具名、参数原文、结果和成功标记。切换、恢复或压缩历史时，引擎沿用这份记录；只有准备发送下一次请求时，适配器才生成目标协议的消息序列。
-
-7. **同批两个调用，一次成功、一次失败。** 仓库的离线用例给出了一种容易处理错的情况：模型发起 `read_file`（ID 为 `a`）和 `grep`（ID 为 `b`）。读取成功，搜索参数却只有一个左花括号 `{`。切换模型后，这两条记录都要能解释清楚。
-
-   | 要解决的问题 | OpenAI 兼容请求 | Anthropic 兼容请求 | 设计取舍 |
-   | --- | --- | --- | --- |
-   | 怎样保留无效参数？ | `function.arguments` 接受字符串，历史调用 `b` 可保留原文 `{`。 | `tool_use.input` 需要对象。转换历史时用 `{"_invalid_arguments":"{"}` 包装原文。 | 保留错误现场供模型理解。这个包装只用于发送历史，工具不会因此重新执行。 |
-   | 两份结果属于谁？ | 按顺序发送两条 `tool` 消息，分别带 `tool_call_id` 为 `a` 和 `b`。 | 在同一条 `user` 消息中放两个 `tool_result` 块，分别带 `tool_use_id` 为 `a` 和 `b`。 | 哪怕两个调用的工具名相同，也能凭 ID 准确配对。压缩历史时按整批取舍，避免下一次请求只剩孤立的结果。 |
-   | 怎样表达部分失败？ | 调用 `b` 的结果正文写明“JSON 无效”；当前适配器发送给 OpenAI 的工具消息没有单独的 `ok` 字段。 | 调用 `b` 的结果同时保留错误正文并设置 `is_error: true`，调用 `a` 仍标记为成功。 | 内部分别记录每次调用的状态。一项参数出错，已经成功的读取结果仍能用于下一轮。 |
+Provider 返回的助手消息还带有停止原因 `finish` 和用量 `input_tokens`、`output_tokens`。引擎用停止原因判断参数是否被截断，并累计本轮各次回复的用量。会话快照沿用内部消息格式，恢复、压缩和切换模型都能使用同一份历史。
 
 ### 3.3 Provider 抽象与流式重试
 
-1. **引擎与 Provider 的分工。** 引擎负责保存历史、执行工具和回填结果。`make_provider` 根据协议创建 `HTTPProvider`（OpenAI 或 Anthropic 兼容接口）或 `MockProvider`（离线演示和测试）。两者都提供 `complete(messages, schemas, emit, log)`，返回 3.2 所示格式的助手消息。
-
-   | 接口参数 | 作用 |
-   | --- | --- |
-   | `messages` | 本次请求使用的内部消息历史，已按上下文预算处理。 |
-   | `schemas` | 可调用工具的名称、说明和参数规则，由适配器转换成目标协议的工具定义。 |
-   | `emit` | 将收到的文本片段显示到终端，让用户在响应结束前就能看到正文。 |
-   | `log` | 记录请求、响应片段和失败尝试等事件，供会话排查使用。 |
-
-2. **同一条历史如何跨协议使用。** 以 3.2 的 `r1` 为例，两种适配器读取同一份内部记录，发出的请求结构如下。会话中途用 `/model` 切换协议后，下一次请求仍可引用此前的工具结果。
-
-   | 协议 | 如何发送调用 | 如何发送结果 |
-   | --- | --- | --- |
-   | OpenAI Chat Completions API（`--provider openai`） | 将 `calls` 转为助手消息里的 `tool_calls`，把参数字符串放进 `function.arguments`。 | 保留 `tool` 角色，用 `tool_call_id: "r1"` 关联调用。 |
-   | Anthropic Messages API（`--provider anthropic`） | 将系统提示放入顶层 `system`，将助手调用转为 `tool_use` 块，并把参数解析成 `input` 对象。 | 用 `tool_result` 块的 `tool_use_id: "r1"` 关联调用，按 `ok` 设置 `is_error`。同批结果合并到随后的一条 `user` 消息中。 |
-
-3. **流式片段如何拼成回复。** HTTP 适配器读取服务端发送的 SSE 事件。正文片段立即交给 `emit`。OpenAI 可能交错发送多个工具调用，因此按调用索引分别拼接 ID、名称和参数；Anthropic 按内容块索引跟踪开始、增量和结束事件，将同一工具的 `partial_json` 片段依次拼接。
-
-   例如，OpenAI 可能先发调用 0 的半段参数，再发调用 1 的参数，最后才补齐调用 0。按到达顺序把文本拼到一起，会混合两个工具的参数。Anthropic 的文本和工具输入也可能分属不同内容块，还要判断增量类型是否与块类型匹配。两套解析器分别完成这些检查，再向引擎返回相同的 `calls` 列表。流中的索引用于拼接本次回复，调用 ID 则用于后续历史中的结果配对。
-
-4. **何时允许执行工具。** OpenAI 需要收到 `[DONE]`；Anthropic 需要收到 `message_stop`，且所有内容块都已结束。适配器随后检查停止原因、用量、调用 ID 和名称，并拒绝同批重复的 ID。通过检查后，完整回复才返回引擎。若在工具参数接收途中断线，该次尝试的半条调用不会被执行。
-
-5. **哪些失败会重试。** 网络超时、HTTP 429、HTTP 5xx，以及响应流提前结束或事件解析失败，会重新发送本次模型请求。含首次请求在内最多尝试三次，两次重试前分别等待 1 秒和 2 秒。HTTP 400、401 等其他 HTTP 错误直接报告。失败尝试中已经显示的文本会留在终端，重试成功后可能再次看到相同开头。
-
-6. **离线 Mock 如何复用引擎。** 默认 Mock 先返回一次 `list_files` 调用，收到真实工具结果后再生成演示答复。指定 `--mock-script` 时，每次调用 `complete` 消耗脚本中的一条预设回复。测试由此可以稳定复现多工具调用、截断和异常参数，同时走实际的引擎与工具执行流程。
+引擎通过 `make_provider` 选取 `HTTPProvider` 或 `MockProvider`，统一调用 `complete(messages, schemas, emit, log)`。`messages` 是本次请求的历史，`schemas` 是工具定义，`emit` 将流式正文显示在终端，`log` 记录请求与响应事件。两种 Provider 都返回 3.2 所示的助手消息，工具执行和结果回填由引擎负责。
 
 #### 3.3.1 跨协议工具调用的设计与验证
 
-1. **为什么单换 `base_url` 不够？** 假设模型在一条回复中要求读文件并搜索文本。OpenAI Chat Completions 把两个调用放进助手的 `tool_calls` 数组，随后要接收两条独立的 `tool` 消息。Anthropic Messages 把调用和正文都放进助手的 `content` 块列表，两个结果要作为 `tool_result` 块放回随后的一条 `user` 消息。如果直接保存第一种请求体，再原样发给第二种接口，结果的角色、参数类型和关联字段都与目标协议不符。为此，会话把“一次调用及其结果”作为需要保存的事实，把“这段历史如何发送”交给当前 Provider。
+**协议差异。** 假设模型同时请求读文件和搜索文本。直接把 OpenAI 的历史交给 Anthropic，第二个接口会收到类型不符的工具参数和角色不符的结果消息。适配器需要双向转换工具调用、保留每个调用的 ID，并按目标协议组织同批结果。
 
-2. **统一消息保留什么？** 助手用 `calls` 列表记录每次调用的 `id`、`name` 和原始 `arguments` 字符串。工具每完成一次就写入一条结果，包含同一 `id`、成功标记 `ok` 和正文 `content`。按 ID 配对可以区分同一批中两次同名调用。保留参数原文还允许工具层报告 JSON 解析错误，即使第二个调用失败，第一个调用的结果仍然有效。
+| 转换位置 | OpenAI Chat Completions API | Anthropic Messages API |
+| --- | --- | --- |
+| 系统提示与工具定义 | `system` 消息和 `tools[].function.parameters` | 顶层 `system` 和 `tools[].input_schema` |
+| 助手发起调用 | 助手的 `tool_calls[]` 记录 `id`、`function.name` 和字符串 `function.arguments` | 助手的 `content[]` 中，`tool_use` 块记录 `id`、`name` 和对象 `input` |
+| 工具返回结果 | 每个调用对应一条 `role: "tool"` 消息，用 `tool_call_id` 配对 | 同批结果进入随后同一条 `user` 消息，每个 `tool_result` 块用 `tool_use_id` 配对，并用 `is_error` 标记失败 |
 
-3. **Provider 如何把两端接起来？** 收到模型响应时，`openai_stream` 和 `anthropic_stream` 分别拼接各自的流式片段，向 `Engine.turn` 返回同一种助手消息。引擎通过 `provider.complete(...)` 取得回复，遍历 `calls`，按工具名和参数调度，并把结果按 ID 写回历史。下一次请求由 `openai_request` 或 `anthropic_request` 将这份历史转换成当前协议。中途执行 `/model` 后，新 Provider 可以重建之前的调用和结果，已经完成的工具无需再执行。
+**调用链。** 收到响应时，`openai_stream` 或 `anthropic_stream` 将原生事件整理成统一的 `calls`。引擎读取每项的工具名和参数，执行后按 ID 记录结果。发起下一次请求时，`openai_request` 或 `anthropic_request` 再将内部历史转换成对应请求体。在会话中执行 `/model anthropic` 会读取配置中的默认模型，追加模型名可临时覆盖。切换后的 Provider 可以直接引用之前的工具结果，无需重新执行。
 
-4. **用同一批调用验证转换。** 回归用例 `test_history_conversion_groups_parallel_results_in_order` 构造两个调用，`a` 读取文件成功，`b` 的搜索参数只有一个左花括号，结果为“JSON 无效”。两种适配器生成的**结果消息**如下，顺序都与原调用一致。
+**同批部分失败的验证。** `test_history_conversion_groups_parallel_results_in_order` 使用同一份历史，调用 `a` 读取文件成功，调用 `b` 搜索时收到的参数只有一个左花括号。下面摘出两个适配器为下一次请求生成的结果消息。
 
-   **OpenAI Chat Completions API** 通过两条消息的 `tool_call_id` 回填结果，失败原因保存在正文中。
+OpenAI 按调用顺序返回两条消息，第二条在正文中保留错误原因。
 
-   ```json
-   [
-     {"role":"tool","tool_call_id":"a","content":"成功"},
-     {"role":"tool","tool_call_id":"b","content":"JSON 无效"}
-   ]
-   ```
+```json
+[
+  {"role":"tool","tool_call_id":"a","content":"成功"},
+  {"role":"tool","tool_call_id":"b","content":"JSON 无效"}
+]
+```
 
-   **Anthropic Messages API** 通过同一条消息中两个块的 `tool_use_id` 回填结果，第二个块还标记了 `is_error`。重建历史调用时，适配器用 `{"_invalid_arguments":"{"}` 保存原始坏参数，使 `tool_use.input` 仍为对象。
+Anthropic 把两个结果放入同一条消息，失败标记只属于调用 `b`。重建这个调用的历史参数时，适配器用 `{"_invalid_arguments":"{"}` 包装原文，使 `input` 仍为对象。
 
-   ```json
-   [
-     {"role":"user","content":[
-       {"type":"tool_result","tool_use_id":"a","content":"成功","is_error":false},
-       {"type":"tool_result","tool_use_id":"b","content":"JSON 无效","is_error":true}
-     ]}
-   ]
-   ```
+```json
+[
+  {"role":"user","content":[
+    {"type":"tool_result","tool_use_id":"a","content":"成功","is_error":false},
+    {"type":"tool_result","tool_use_id":"b","content":"JSON 无效","is_error":true}
+  ]}
+]
+```
 
-5. **抽象的边界在哪里？** 新协议可以复用工具调度、审批、结果配对和会话持久化，只需为正常调用提供请求转换和响应解析。当前引擎在异常处理上仍识别两种原始截断原因 `length`、`max_tokens`，也会识别正文里误写的 `tool_calls`、`tool_use` 来提示模型重发。接入第三种协议时，还需核对这两处规则。
+**现有边界。** 正常工具调度、审批和持久化共用一套引擎。异常处理仍识别两种截断原因 `length`、`max_tokens`，也识别误写在普通正文中的 `tool_calls` 和 `tool_use`，以便提示模型纠正。扩展其他协议时需要核对这些规则。
+
+#### 3.3.2 流式响应、重试与离线验证
+
+1. **拼接片段。** 正文片段立即交给 `emit`。OpenAI 可能交错返回多个调用，解析器按调用索引分别拼接名称和参数。Anthropic 按内容块索引区分正文与工具输入，并拼接同一工具的 `partial_json`。索引用于组装本次响应，调用 ID 用于后续历史配对。
+2. **交付完整响应。** OpenAI 流以 `[DONE]` 结束。Anthropic 需要所有内容块结束并收到 `message_stop`。解析器检查停止原因、用量、调用 ID 和名称，拒绝同批重复 ID。引擎只在收到完整回复后调度工具，可避免断线时执行半条调用。
+3. **重试模型请求。** 超时、HTTP 429、HTTP 5xx 或不完整的流会触发重试。含首次请求最多尝试三次，重试前分别等待 1 秒和 2 秒。HTTP 400、401 直接报告。重试前已经显示的正文可能在终端重复出现。
+4. **离线复现。** 默认 Mock 先请求 `list_files`，再依据真实工具结果生成答复。`--mock-script` 可以指定每次 `complete` 的回复，用固定输入验证同批多调用、截断和异常参数。协议测试另用流式事件样本验证两个解析器，覆盖交错片段和提前断线。
 
 ### 3.4 工具、授权与输出
 
-| 工具 | 主要参数及行为 |
-| --- | --- |
-| `list_files` | `path` 默认当前目录，指定 `pattern` 可递归 glob 匹配，遍历时跳过 .git、node_modules 和虚拟环境等目录 |
-| `read_file` | `path`、可选 `start_line` 和 `end_line`，按从 1 开始的闭区间返回带行号的 UTF-8 文本。指定结束行时读到该行即停，区间输出截断时报告区间内的实际行数 |
-| `write_file` | `path`、`content`，显示 diff，确认后创建父目录并原子替换文件 |
-| `edit_file` | `path`、`old_string`、`new_string`，可选 `encoding` 指定原文件编码。旧文本须唯一匹配，写回时保留原编码、字节序、BOM 及替换区域以外的换行 |
-| `grep` | `pattern` 正则，可选 `path`、`glob`，返回匹配路径、行号和文本 |
-| `run_shell` | `command`、`timeout`（默认 60 秒），从工作目录启动，返回退出码和输出。验证短文本可传 `expected_stdout`，完整标准输出一致且进程正常退出才算通过；统一 CRLF/LF 并忽略一个末尾换行，截断时报告无法核验 |
+| 工具 | 主要参数 | 行为与结果 |
+| --- | --- | --- |
+| `list_files` | `path`、`pattern` | 默认列出当前目录。通配模式支持递归匹配，遍历时跳过依赖和虚拟环境等目录。空目录和模式未命中各有提示。 |
+| `read_file` | `path`、`start_line`、`end_line` | 读取 UTF-8 文本，返回带行号的内容。行号从 1 开始，两端都包含。可按区间续读截断结果。 |
+| `grep` | `pattern`、`path`、`glob` | 按正则搜索，返回路径、行号和匹配文本。零处匹配也算成功。 |
+| `write_file` | `path`、`content` | 展示差异，经批准后创建必要的父目录并原子替换文件。 |
+| `edit_file` | `path`、`old_string`、`new_string`、可选 `encoding` | 旧文本须唯一匹配。写回保留原编码、字节序、BOM 及替换区域以外的换行。 |
+| `run_shell` | `command`、`timeout`、可选 `expected_stdout` | 在工作目录执行命令，默认超时 60 秒，返回退出码和输出。指定预期输出时，同时检查退出码和完整标准输出，统一 CRLF/LF 并忽略一个末尾换行。截断时报告无法核验。 |
 
-编辑已有文件时，`edit_file` 优先识别 UTF-8、UTF-16、UTF-32 的 BOM。无 BOM 时依次尝试 UTF-8、GBK、GB18030。如果已知原编码，应直接指定 `encoding`，例如 `cp1252`、`big5`、`shift_jis` 或无 BOM 的 `utf-16-be`。当自动识别为旧编码、且要把纯 ASCII 片段换成非 ASCII 文本时，工具会要求明确编码。原编码无法表示替换字符时，文件保持原样。
+**权限边界。** 文件工具逐级校验相对路径，排除符号链接和 Windows 重解析点。写入、编辑和 Shell 默认需要用户批准。Shell 的起始目录是工作目录，实际访问范围取决于操作系统账号的权限。系统提示要求模型将读取的文件和命令输出视为数据。提示注入与审批的验证见 [4.4.3 文件内容中的提示注入防护](#443-文件内容中的提示注入防护)。
 
-`list_files` 会区分目录没有可见条目和通配符没有命中；`grep` 在没有匹配时报告 0 处匹配。这三种结果都表示工具执行成功。
-
-文件操作逐级校验相对路径并排除符号链接和 Windows 重解析点。Shell 在当前操作系统用户的权限下运行，经批准的命令可以访问工作目录以外的资源。处理不可信项目时，应在独立的低权限账号、容器或虚拟机中运行。系统提示要求把文件和命令输出当作数据，所有写操作默认还需人工确认。
+**文件编码。** `edit_file` 优先识别 UTF-8、UTF-16、UTF-32 的 BOM，无 BOM 时按 UTF-8、GBK、GB18030 的顺序尝试解码。已知编码可直接传 `encoding`。自动识别为旧编码且需要把纯 ASCII 片段换成非 ASCII 文本时，工具会要求明确编码。替换字符无法按原编码表示时保留原文件，详见 [4.4.2 精确编辑与文件格式保留](#442-精确编辑与文件格式保留)。
 
 ## 4. 第四章必做题与加分项
 
